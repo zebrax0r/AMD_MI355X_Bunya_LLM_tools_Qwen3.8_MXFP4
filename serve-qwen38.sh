@@ -70,6 +70,72 @@ else
     warn "No config file at $ENV_FILE (copy qwen38-env.example to qwen38.env); using environment only."
 fi
 
+# ── Shadowed-config detector ────────────────────────────────────────────────
+#
+# Every line in qwen38-env.example is `export VAR="${VAR:-default}"` so that a
+# shell export beats the file. That is deliberate and useful (sbatch --export,
+# one-off overrides on the command line) — but it has a nasty failure mode:
+#
+#   $ source qwen38.env          # exports MODEL_ID=<old value> into your shell
+#   $ vi qwen38.env              # change MODEL_ID
+#   $ source qwen38.env          # ${MODEL_ID:-<new>} sees the OLD export...
+#   $ ./serve-qwen38.sh check    # ...so your edit is silently discarded
+#
+# HIT FOR REAL ON BUN161, 14 AUG 2026. The edit to MODEL_ID had no effect and
+# 'check' then advised setting MODEL_ID — which had already been done. A stale
+# value here is expensive: it points a 1.4 TB download at the wrong repo, or
+# serves a different checkpoint than the one you think you are benchmarking.
+#
+# So: re-evaluate the file in a CLEAN subshell, with these variables unset, and
+# compare. Warn rather than override — "exported wins" is documented behaviour
+# and sometimes exactly what you meant. But say so, loudly, and name the fix.
+#
+# NOTE you do not need to source qwen38.env to use these scripts at all; they
+# read it themselves. Sourcing is only for shells that want $MODEL_CACHE_DIR.
+SHADOW_VARS=(MODEL_ID MODEL_CACHE_DIR SGLANG_IMAGE WEIGHTS_GB SERVED_MODEL_NAME
+             SPECULATIVE TP_SIZE CONTEXT_LEN MEM_FRACTION SIF_PATH)
+SHADOWED=()
+
+if [[ -f "$ENV_FILE" ]]; then
+    unset_args=()
+    for v in "${SHADOW_VARS[@]}"; do unset_args+=(-u "$v"); done
+    # printf one value per line, in SHADOW_VARS order, from a shell that has
+    # never seen these variables. That is what the file ALONE produces.
+    file_only="$(env "${unset_args[@]}" bash -c '
+        source "$1" >/dev/null 2>&1
+        for v in "${@:2}"; do printf "%s\n" "${!v-}"; done
+    ' _ "$ENV_FILE" "${SHADOW_VARS[@]}" 2>/dev/null || true)"
+
+    if [[ -n "$file_only" ]]; then
+        i=0
+        while IFS= read -r want; do
+            v="${SHADOW_VARS[$i]}"; i=$(( i + 1 ))
+            got="${!v-}"
+            # Only interesting when the file names a value and the live value
+            # differs. A file that leaves something empty is not being shadowed.
+            [[ -n "$want" && "$got" != "$want" ]] && SHADOWED+=("$v"$'\t'"$want"$'\t'"$got")
+        done <<<"$file_only"
+    fi
+fi
+
+if (( ${#SHADOWED[@]} )); then
+    shadow_names=()
+    warn "An exported variable is OVERRIDING $ENV_FILE:"
+    for row in "${SHADOWED[@]}"; do
+        IFS=$'\t' read -r v want got <<<"$row"
+        shadow_names+=("$v")
+        printf '    %-18s file: %-46s  in use: %s\n' \
+            "$v" "${want:-<empty>}" "${got:-<empty>}" >&2
+    done
+    env_base="$(basename "$ENV_FILE")"
+    warn "  If you did not mean to override these, you almost certainly sourced
+  $env_base BEFORE editing it — the export then wins over every later edit,
+  so the file now says one thing and the server does another. Clear them:
+      unset ${shadow_names[*]}
+  You do NOT need to source $env_base to run this script; it reads the file
+  itself. Source it only in shells that want \$MODEL_CACHE_DIR."
+fi
+
 # The id the verified cookbook cell names. It is NOT publicly readable as of
 # 14 Aug 2026 — see MODEL_CANDIDATES below and './serve-qwen38.sh check'.
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4}"
@@ -125,7 +191,33 @@ INT8_MAMBA_CHECKPOINT="${INT8_MAMBA_CHECKPOINT:-0}"
 LINEAR_ATTN_BACKEND="${LINEAR_ATTN_BACKEND:-}"
 
 ENABLE_AITER="${ENABLE_AITER:-1}"
-FLYDSL_FORCE="${FLYDSL_FORCE:-1}"
+# DEFAULT 0 AS OF 14 AUG 2026 (was 1). AITER_FLYDSL_FORCE is OURS, not upstream's
+# — the verified MI355X cell sets SGLANG_USE_AITER=1 and nothing else, and the
+# variable appears nowhere in SGLang mainline (aiter reads it). It was the
+# measured fast path on Kimi K3's MoE shapes; on Qwen3.8's it is unvalidated and
+# could route gemms to a JIT path with no tuned config for these shapes — the
+# heuristic fallback bench-qwen38.sh warns about. Off means the first run is
+# upstream's cell verbatim; turn it on as the FIRST A/B, with a measurement.
+FLYDSL_FORCE="${FLYDSL_FORCE:-0}"
+
+# ── ROCm/AITER tuning ladder — all default OFF ──────────────────────────────
+# None of these are in upstream's verified cell; all are SGLang defaults-off that
+# look matched to this architecture. Untested here. One at a time, re-bench each.
+ROCM_MULTI_STREAM="${ROCM_MULTI_STREAM:-0}"
+GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-}"
+AITER_KV_LAYOUT="${AITER_KV_LAYOUT:-}"
+AITER_FP8_PER_TOKEN="${AITER_FP8_PER_TOKEN:-0}"
+
+case "$AITER_KV_LAYOUT" in
+    ""|nhd|vectorized_5d) ;;
+    *) die "AITER_KV_LAYOUT must be empty, nhd or vectorized_5d, got '$AITER_KV_LAYOUT'." ;;
+esac
+
+# Validated here because it is used in an arithmetic context below, where a
+# non-numeric value is a hard shell error rather than a wrong answer.
+[[ -z "$GPU_MAX_HW_QUEUES" || "$GPU_MAX_HW_QUEUES" =~ ^[0-9]+$ ]] \
+    || die "GPU_MAX_HW_QUEUES must be a positive integer or empty, got '$GPU_MAX_HW_QUEUES'."
+
 ROCM_MODE="${ROCM_MODE:-auto}"
 AITER_GPU_ARCHS="${AITER_GPU_ARCHS:-}"
 ROCMINFO_SHIM="${ROCMINFO_SHIM:-auto}"
@@ -1138,9 +1230,22 @@ PY
     case "$rc" in
         0) log "check passed." ;;
         1) warn "check FAILED: this image cannot serve $MODEL_ID." ;;
-        2) warn "check INCONCLUSIVE: could not read the model config.
-  If MODEL_ID showed UNREACHABLE in the table above, set MODEL_ID in $ENV_FILE
-  to one of the candidates that reported OK, then re-run check." ;;
+        2) # Do not advise "set MODEL_ID in the config file" when the config file
+           # ALREADY sets it and an export is winning — that advice sends you to
+           # re-do something you have already done. Diagnose the shadow instead.
+           # ${SHADOWED[@]+...} so an empty array is safe under `set -u` on the
+           # older bash some images still ship.
+           if printf '%s\n' ${SHADOWED[@]+"${SHADOWED[@]}"} | grep -q '^MODEL_ID	'; then
+               warn "check INCONCLUSIVE: could not read the model config — and the MODEL_ID
+  it tried is NOT the one $ENV_FILE sets. An exported MODEL_ID is overriding
+  the file (see the warning above). Run:
+      unset MODEL_ID && ./serve-qwen38.sh check"
+           else
+               warn "check INCONCLUSIVE: could not read the model config.
+  If MODEL_ID showed UNREACHABLE or NOT FOUND in the table above, set MODEL_ID in
+  $ENV_FILE to one of the candidates that reported OK, set WEIGHTS_GB to match,
+  then re-run check in a shell where MODEL_ID is not exported."
+           fi ;;
         3) warn "check INCONCLUSIVE: the image's model registry would not import,
   so this says nothing about whether it can serve $MODEL_ID." ;;
         *) warn "check exited with status $rc." ;;
@@ -1797,8 +1902,45 @@ if [[ "$ENABLE_AITER" == "1" ]]; then
     # the first variable to drop.
     if [[ "$FLYDSL_FORCE" == "1" ]]; then
         aiter_env+=(--env AITER_FLYDSL_FORCE=1)
-    else
-        warn "FLYDSL_FORCE=0 — using aiter's prebuilt gemm path, below the tuned MoE numbers."
+        log "AITER_FLYDSL_FORCE=1 — gemms routed through the FlyDSL JIT compiler."
+        log "  This is NOT in upstream's MI355X cell. A/B it against FLYDSL_FORCE=0"
+        log "  and keep whichever the bench actually prefers on these shapes."
+    fi
+
+    # The rest of the ladder. Each is a plain env var an older image simply
+    # ignores, which is the safe direction — there is nothing to capability-probe.
+    if [[ "$ROCM_MULTI_STREAM" == "1" ]]; then
+        aiter_env+=(--env SGLANG_ROCM_USE_MULTI_STREAM=1)
+        # Upstream's own note: "Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue
+        # serialization." Without it the dual streams serialise on the hardware
+        # queue and the feature is a no-op at best.
+        if [[ -z "$GPU_MAX_HW_QUEUES" ]]; then
+            GPU_MAX_HW_QUEUES=5
+            log "ROCM_MULTI_STREAM=1 — setting GPU_MAX_HW_QUEUES=5 (required, else the"
+            log "  two MoE streams serialise on one hardware queue and it buys nothing)."
+        elif (( GPU_MAX_HW_QUEUES < 5 )); then
+            warn "ROCM_MULTI_STREAM=1 needs GPU_MAX_HW_QUEUES>=5, got $GPU_MAX_HW_QUEUES.
+  The shared-expert and routed-expert streams will serialise on one hardware
+  queue, so dual-stream MoE will not help. Raise it or set ROCM_MULTI_STREAM=0."
+        fi
+        log "Dual-stream MoE ENABLED (shared vs routed experts). Qwen3.8 runs 1 shared"
+        log "  + 10 routed per token, which is the shape this targets. UNMEASURED here."
+    fi
+    [[ -n "$GPU_MAX_HW_QUEUES" ]] && aiter_env+=(--env "GPU_MAX_HW_QUEUES=$GPU_MAX_HW_QUEUES")
+
+    if [[ -n "$AITER_KV_LAYOUT" ]]; then
+        aiter_env+=(--env "SGLANG_AITER_KV_CACHE_LAYOUT=$AITER_KV_LAYOUT")
+        log "AITER KV cache layout: $AITER_KV_LAYOUT (default is nhd)."
+        [[ "$AITER_KV_LAYOUT" == "vectorized_5d" ]] && log \
+            "  vectorized_5d is the SHUFFLE layout pa_decode_gluon consumes natively,
+  so full-attention decode avoids runtime permutes. Qwen3.8 has 23 such
+  layers (64 Q over 4 KV heads). UNMEASURED here."
+    fi
+
+    if [[ "$AITER_FP8_PER_TOKEN" == "1" ]]; then
+        aiter_env+=(--env SGLANG_USE_AITER_FP8_PER_TOKEN=1)
+        log "AITER per-token FP8 ENABLED — this checkpoint is hybrid (MXFP4 experts,"
+        log "  FP8 attention/dense), so it is the FP8 half this touches. UNMEASURED."
     fi
 else
     warn "ENABLE_AITER=0 — SGLANG_USE_AITER is NOT set. This drops the one environment

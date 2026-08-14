@@ -66,11 +66,13 @@ if [[ -f "$ENV_FILE" ]]; then
     source "$ENV_FILE"
 fi
 
-# The pre-source capture above is necessary but NOT sufficient. The README tells
-# you to 'source qwen38.env' for MODEL_CACHE_DIR and friends — and once you have,
-# the whole config file is in the environment, so the capture records the sweep
+# The pre-source capture above is necessary but NOT sufficient. Anyone who has
+# run 'source qwen38.env' — for MODEL_CACHE_DIR in their own shell commands — has
+# the whole config file in their environment, so the capture records the sweep
 # shape as though the caller had typed it. All four values arriving together is
-# the signature.
+# the signature. (This is the same hazard the shadow detector below reports for
+# the non-BENCH_* variables; here it is handled by value comparison instead,
+# because a BENCH_* override is legitimate and common.)
 #
 # By value alone the two cases are indistinguishable. So ask the config file what
 # IT sets, in a subshell with these four unset, and treat an exact match as "this
@@ -95,12 +97,42 @@ if [[ -f "$ENV_FILE" ]]; then
     done
 fi
 
+# The BENCH_* shape is disambiguated above. The rest of the config has the same
+# hazard with no defence: sourcing qwen38.env once exports these, and every later
+# edit to the file is then silently discarded. Benchmarking one checkpoint while
+# the file says another is a particularly bad way to lose an afternoon, so name
+# it. Same detector as serve-qwen38.sh; warn, never override.
+if [[ -f "$ENV_FILE" ]]; then
+    _sv=(SERVED_MODEL_NAME MODEL_CACHE_DIR SIF_PATH MODEL_ID)
+    _ua=(); for _v in "${_sv[@]}"; do _ua+=(-u "$_v"); done
+    _fo="$(env "${_ua[@]}" bash -c '
+        source "$1" >/dev/null 2>&1
+        for v in "${@:2}"; do printf "%s\n" "${!v-}"; done
+    ' _ "$ENV_FILE" "${_sv[@]}" 2>/dev/null || true)"
+    _shadow=()
+    if [[ -n "$_fo" ]]; then
+        _i=0
+        while IFS= read -r _want; do
+            _v="${_sv[$_i]}"; _i=$(( _i + 1 ))
+            [[ -n "$_want" && "${!_v-}" != "$_want" ]] && _shadow+=("$_v")
+        done <<<"$_fo"
+    fi
+    if (( ${#_shadow[@]} )); then
+        warn "An exported variable is OVERRIDING $ENV_FILE: ${_shadow[*]}"
+        warn "  You are benchmarking a configuration the config file does not describe."
+        warn "  Fix with:  unset ${_shadow[*]}"
+    fi
+fi
+
 PORT="${PORT:-30000}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8}"
 MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-}"
 SIF_PATH="${SIF_PATH:-}"
 
-[[ -n "$MODEL_CACHE_DIR" ]] || die "MODEL_CACHE_DIR is not set (source qwen38.env or export it)."
+# This script already sourced $ENV_FILE above, so "source it" is not the advice —
+# if MODEL_CACHE_DIR is still empty, the file does not set it.
+[[ -n "$MODEL_CACHE_DIR" ]] || die "MODEL_CACHE_DIR is not set. Set it in $ENV_FILE (this script reads that file
+     itself — you do not need to source it)."
 SIF_PATH="${SIF_PATH:-$MODEL_CACHE_DIR/qwen38-mi355x.sif}"
 if [[ "$SIF_PATH" == */ || -d "$SIF_PATH" ]]; then
     SIF_PATH="${SIF_PATH%/}/qwen38-mi355x.sif"
@@ -198,10 +230,24 @@ LOG_FILE="${LOG_FILE:-$MODEL_CACHE_DIR/qwen38-server.log}"
 if [[ -r "$LOG_FILE" ]]; then
     if grep -qiE 'no tuned FlyDSL config|heuristic FlyDSL fallback|falling back to.*heuristic' "$LOG_FILE"; then
         warn "MoE is on the SLOW heuristic FlyDSL fallback (no tuned MXFP4 config for these shapes)."
-        warn "  Confirm ENABLE_AITER=1 so SGLANG_USE_AITER / AITER_FLYDSL_FORCE are set —"
-        warn "  SGLANG_USE_AITER=1 is the one env var the verified MI355X cell requires."
+        warn "  Confirm ENABLE_AITER=1 so SGLANG_USE_AITER=1 is set — that is the one env"
+        warn "  var the verified MI355X cell requires."
+        if [[ "${FLYDSL_FORCE:-0}" == "1" ]]; then
+            warn "  FLYDSL_FORCE=1 is forcing gemms through the FlyDSL JIT compiler. If there"
+            warn "  is no tuned config for these shapes, that is how you LAND on the"
+            warn "  heuristic path. Re-run with FLYDSL_FORCE=0 and compare — that variable"
+            warn "  is ours, not upstream's, and this is exactly the case it can cost you."
+        fi
     else
         log "No FlyDSL-fallback warning in the server log — tuned MoE path looks active. OK"
+    fi
+    # Which gemm path was actually taken. FLYDSL_FORCE is a divergence from
+    # upstream's cell, so the bench has to say which side of the A/B produced
+    # these numbers rather than leaving it to the reader's memory.
+    log "aiter env on the run being measured: FLYDSL_FORCE=${FLYDSL_FORCE:-0}, ENABLE_AITER=${ENABLE_AITER:-1}"
+    if grep -qiE 'flydsl|jit compil|tuned config' "$LOG_FILE"; then
+        log "MoE/gemm path lines from the server log:"
+        grep -iE 'flydsl|jit compil|tuned config' "$LOG_FILE" | head -4 | sed 's/^/    /'
     fi
     # A quantisation SGLang resolved differently from what you expected is the
     # other way to be slow without an error. Surface what it actually picked.
@@ -233,6 +279,11 @@ OUT_FILE="$BENCH_DIR/${STAMP}-${MODE}.txt"
     echo "# SPECULATIVE=${SPECULATIVE:-off} MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-auto}"
     echo "# DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-?} MAMBA_RADIX_STRATEGY=${MAMBA_RADIX_STRATEGY:-auto}"
     echo "# MAMBA_FULL_MEMORY_RATIO=${MAMBA_FULL_MEMORY_RATIO:-auto} ENABLE_AITER=${ENABLE_AITER:-?}"
+    # The tuning ladder. A result file that does not record which rungs were up
+    # cannot be compared against another one, which is the whole point of these.
+    echo "# ladder: FLYDSL_FORCE=${FLYDSL_FORCE:-0} ROCM_MULTI_STREAM=${ROCM_MULTI_STREAM:-0}" \
+         "AITER_KV_LAYOUT=${AITER_KV_LAYOUT:-nhd} AITER_FP8_PER_TOKEN=${AITER_FP8_PER_TOKEN:-0}" \
+         "GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-default}"
     echo "# no published MI355X reference exists for this model — these are first numbers"
     echo
 } > "$OUT_FILE"

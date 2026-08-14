@@ -104,16 +104,36 @@ Three, all environmental:
 2. **Adds `--api-key` and `--served-model-name`.** The key is the direct
    consequence of (1) — it is the only thing gating the port. It is generated
    once and persisted to `$MODEL_CACHE_DIR/qwen38-api-key`.
-3. **Forces `SGLANG_SET_CPU_AFFINITY=0`.** The image enables affinity pinning,
-   which pins to CPUs from the full node topology and crashes under a SLURM
-   cgroup that owns only a subset (`CPU number N is not eligible`). Upstream has
-   no cgroup to trip over.
+3. **Forces `SGLANG_SET_CPU_AFFINITY=0`.** Affinity pinning computes
+   `total_pcores = psutil.cpu_count(logical=False)` — the **whole node's** cores,
+   ignoring the cgroup — then hands rank *i* the slice `[i·n, (i+1)·n)`. Under a
+   SLURM cgroup that owns only a subset, high ranks name CPUs we do not have and
+   startup dies with `CPU number N is not eligible`. Upstream has no cgroup to
+   trip over.
 
-There is one more that is not upstream's and is worth flagging separately:
-`AITER_FLYDSL_FORCE=1` is set (via `FLYDSL_FORCE`). That is carried over from the
-K3 work, where it interacts with the read-only-`.sif` problem described below.
-**If you are ever chasing a numerics difference against upstream, this is the
-first variable to drop.**
+   **This costs less than it looks like it does.** SGLang's own default for
+   `SGLANG_SET_CPU_AFFINITY` is already `False` (`srt/environ.py`), so we only
+   diverge if the *image* turns it on — check with
+   `apptainer exec $SIF_PATH env | grep -iE 'AFFINITY|NUMA'`. And **NUMA binding
+   is a separate mechanism that still runs**: `scheduler.py` gates it on
+   `SGLANG_NUMA_BIND_V2`, which defaults **true** and uses the cgroup-aware
+   `numactl` path in `numa_utils.py` — it probes whether the binding can be
+   applied before applying it, and warns-and-continues if not. So we lose
+   per-rank *core partitioning*, not NUMA memory locality. (That path needs
+   `numactl` inside the image; if it is missing, binding is skipped with a
+   warning. Worth confirming once.)
+
+   If you allocate the whole node's CPUs (`--exclusive`), the cgroup owns every
+   core, the arithmetic above lines up, and `SET_CPU_AFFINITY=1` becomes
+   available — that is the way to get per-rank isolation back.
+
+Not a deviation any more, but worth recording: **`AITER_FLYDSL_FORCE` now
+defaults to `0`** (it was `1` until 14 Aug 2026). It is ours, not upstream's, and
+appears nowhere in SGLang mainline — aiter reads it. It was the measured fast path
+on Kimi K3's MoE shapes; Qwen3.8's are different, and forcing the JIT path when
+there is no tuned config for these shapes is precisely how you land on the slow
+heuristic fallback. So the out-of-box run is now upstream's cell verbatim. Turning
+it back on is the first rung of the [tuning ladder](#tuning-ladder).
 
 ---
 
@@ -122,16 +142,21 @@ first variable to drop.**
 This is the first thing that will stop you, so it is the first thing documented.
 
 `Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4` is the id the verified cell names and the
-cookbook links to. As of **14 Aug 2026** it returns **HTTP 401** to an anonymous
-request — the model page, the API, and `resolve/main/config.json` all refuse —
-while the BF16 and FP8 repos of the same model are public and return 200. It is
-private or gated.
+cookbook links to. As of **14 Aug 2026** it is not fetchable: anonymously it
+returns **HTTP 401** (model page, API and `resolve/main/config.json` all refuse),
+and **with a token that lacks access it returns 404** — observed on Bunya the same
+day. The BF16 and FP8 repos of the same model are public and return 200. Either
+code means the same thing for you: it is private or gated and you cannot pull it.
+
+Do not read 404 as "I typed the name wrong". `check` prints whichever code you
+actually got, and distinguishes "no `HF_TOKEN` was sent" from "your `HF_TOKEN` did
+not open it", because those have different fixes.
 
 Two public MXFP4 checkpoints exist:
 
 | Repo | Size | Shards | `quant_method` | Base | Notes |
 |---|---:|---:|---|---|---|
-| `Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4` | ? | ? | ? | — | **The validated one. 401 today.** |
+| `Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4` | ? | ? | ? | — | **The validated one. 401/404 today.** |
 | `amd/Qwen3.8-2.4T-A95B-Quark-MXFP4` | 1372 GB | 213 | `quark` | Qwen …-FP8 | AMD's own Quark MXFP4. Smallest, so the most KV/GDN headroom. |
 | `Inferact/Qwen3.8-2.4T-A95B-MXFP4` | 1597 GB | 101 | `mxfp4` | Qwen …-A95B | Declares the exact string SGLang's auto-resolution keys on. Community repo. |
 
@@ -168,7 +193,7 @@ different fixes.)
 reports OK, set `WEIGHTS_GB` to match, and re-run `check`.
 
 **Run `check` before `download`.** Skipping it is how you spend hours discovering
-that the repo still 401s for your token.
+that the repo still 401s (or 404s) for your token.
 
 ---
 
@@ -603,8 +628,66 @@ step has one variable in it.
    TTFT under load, and the benchmark *understates* the gain for agentic clients
    because random prompts share no prefixes at all.
 
-`bench-qwen38.sh` records `MODEL_ID`, image tag, every relevant flag, the
-hostname and the date into each result file. Compare with `ls -t $MODEL_CACHE_DIR/bench`.
+`bench-qwen38.sh` records `MODEL_ID`, image tag, every relevant flag, the tuning
+ladder's state, the hostname and the date into each result file. Compare with
+`ls -t $MODEL_CACHE_DIR/bench`.
+
+### Are the defaults already optimal?
+
+Mostly yes, and that was checked against SGLang's source rather than assumed.
+**Every knob this repo leaves empty resolves to SGLang's own default** — which is
+exactly what upstream's verified cell does, since it passes none of them either:
+
+| Knob | SGLang default | Ours |
+|---|---|---|
+| `chunked_prefill_size` | `None` | empty |
+| `cuda_graph_max_bs_decode` | `None` | empty |
+| `max_mamba_cache_size` | `None` | empty |
+| `mamba_ssm_dtype` | `None` | empty |
+| `mamba_radix_cache_strategy` | `"auto"` | empty |
+| `mamba_full_memory_ratio` | `0.9` | empty |
+| `max_running_requests` | `None` | empty |
+
+So there is nothing being left on the table by omission. The two things that
+*were* worth changing are covered above: `FLYDSL_FORCE` now defaults off, and the
+`SET_CPU_AFFINITY` framing was overstated.
+
+**Dropping the K3 recipe's `SGLANG_AITER_K3_OPT` provably costs Qwen3.8 nothing.**
+That variable still exists in mainline `mxfp4.py`, but it has exactly one effect —
+`_inter_align = 128 if _aiter_k3_opt else 256`, applied as
+`round_up(intermediate_size_per_partition, _inter_align)`:
+
+```
+Qwen3.8   moe_intermediate 2048 / tp8 = 256  ->  align128 = 256, align256 = 256   delta    0
+Kimi K3   moe_intermediate 3072 / tp8 = 384  ->  align128 = 384, align256 = 512   delta +128
+```
+
+Qwen3.8 is unpadded either way, so K3's +33% memory saving simply does not arise
+here. Same for the hidden dimension: `round_up(8192, 256) = 8192`, no pad.
+
+<a name="tuning-ladder"></a>
+### Tuning ladder — untested knobs that look matched to this model
+
+None of these are in upstream's verified cell. All are SGLang defaults-off, all
+are **off by default here**, and none are measured on Bunya. Treat each as a
+hypothesis with a benchmark attached: turn on **one**, run `./bench-qwen38.sh
+sweep` with `BENCH_REPEATS=3`, keep it only if it beats the error bar.
+
+| Rung | Variable | Why it plausibly helps *this* model |
+|---|---|---|
+| 1 | `FLYDSL_FORCE=1` | Was the measured fast path on K3's MXFP4 MoE on the same gfx950. May or may not carry to Qwen3.8's shapes — that is the whole question. |
+| 2 | `SPECULATIVE=nextn` | MTP ships in the checkpoint, so it is free. Pin `MAX_RUNNING_REQUESTS` or it silently becomes 48. |
+| 3 | `ROCM_MULTI_STREAM=1` | Dual-stream MoE: the shared expert and the routed experts stop serialising. Qwen3.8 routes **10 experts + 1 shared** per token, which is exactly the shape this targets. Needs `GPU_MAX_HW_QUEUES>=5`; the script sets 5 for you. |
+| 4 | `AITER_KV_LAYOUT=vectorized_5d` | The SHUFFLE layout `pa_decode_gluon` and aiter's CK FmhaBatchPrefill consume natively, so full-attention decode avoids runtime permutes. Qwen3.8 has 23 such layers. |
+| 5 | `AITER_FP8_PER_TOKEN=1` | The checkpoint is hybrid — MXFP4 experts, **FP8** attention and dense. This touches that FP8 half. |
+
+**One knob that is not on this ladder, and must not be added to it:**
+`SGLANG_USE_AITER_MOE_GU_ITLV`. It reads like a performance switch and is not
+one. SGLang's `mxfp4.py` uses `gate_up_interleaved` to select a **weight-layout
+transform** matched to how the checkpoint physically stores `w13` — the
+non-interleaved branch is commented *"e.g. K3 Latent MoE"*. Flipping it gives you
+**wrong output, not slower output**, and wrong output from this model looks like
+fluent, confident nonsense rather than an error.
 
 ---
 
@@ -804,7 +887,7 @@ for each default; this table is the index.
 |---|---|---|
 | `MODEL_CACHE_DIR` | *(required)* | Scratch path for HF cache + `.sif` + API key + log (~1.5 TB) |
 | `HF_TOKEN` / `HF_TOKEN_FILE` | *(required)* | HuggingFace token, inline or from a file |
-| `MODEL_ID` | `Qwen/…-FP8-MXFP4` | The validated repo — **401 today**, see above |
+| `MODEL_ID` | `Qwen/…-FP8-MXFP4` | The validated repo — **unavailable (401/404)**, see above |
 | `MODEL_CANDIDATES` | *(3 repos)* | What `check` probes |
 | `SERVED_MODEL_NAME` | `qwen3.8` | Name clients use in the `model` field |
 | `WEIGHTS_GB` | `1372` | Sizing for the space preflight and the GB/s readout |
@@ -833,8 +916,8 @@ for each default; this table is the index.
 | `ROCM_MODE` | `auto` | `rocm` / `devices` GPU passthrough; probed and cached |
 | `ROCMINFO_SHIM` | `auto` | Replays the host's `rocminfo` when the image's is broken |
 | `ENABLE_AITER` | `1` | Sets `SGLANG_USE_AITER=1` — the cell's one required env var |
-| `FLYDSL_FORCE` | `1` | `AITER_FLYDSL_FORCE`. Ours, not upstream's — drop it first when diffing |
-| `SET_CPU_AFFINITY` | `0` | Ours: the image's pinning crashes under a SLURM cgroup |
+| `FLYDSL_FORCE` | `0` | `AITER_FLYDSL_FORCE`. Ours, not upstream's. Rung 1 of the tuning ladder |
+| `SET_CPU_AFFINITY` | `0` | Matches SGLang's own default. NUMA binding still runs — see above |
 | `WEIGHT_LOAD_THREADS` | `8` | Suppresses SGLang's single-threaded fallback |
 | `LOAD_FORMAT` / `PRESHARDED_PATH` | *(empty)* | `presharded` for allocations you restart in |
 | `EXTRA_ENGINE_ARGS` | *(empty)* | Appended verbatim, e.g. `--ep-size 8` |
@@ -843,9 +926,32 @@ for each default; this table is the index.
 
 ## Troubleshooting
 
-**`check` says UNREACHABLE (401) for `Qwen/…-FP8-MXFP4`.**
-Expected as of 14 Aug 2026. Pick a candidate that reports OK, set `MODEL_ID` and
-`WEIGHTS_GB` in `qwen38.env`, re-run `check`.
+**I edited `qwen38.env` and nothing changed.**
+You sourced it before editing. Every line is `export VAR="${VAR:-default}"` so
+that shell exports win; once `source qwen38.env` has exported the old value,
+`${VAR:-<your new value>}` sees it and your edit is discarded — silently, in that
+shell, forever. Hit on bun161 on 14 Aug 2026, where an edited `MODEL_ID` had no
+effect and `check` then advised setting the very thing that had just been set.
+
+The scripts now detect this and print the offending variable, both values, and
+the fix:
+
+```
+[qwen38 WARN] An exported variable is OVERRIDING /…/qwen38.env:
+    MODEL_ID    file: amd/Qwen3.8-2.4T-A95B-Quark-MXFP4    in use: Qwen/…-FP8-MXFP4
+  … Clear them:
+      unset MODEL_ID
+```
+
+**You do not need to source `qwen38.env` at all** — every script reads it itself.
+Source it only in a shell that wants `$MODEL_CACHE_DIR` for its own commands, and
+remember that doing so pins those values in that shell.
+
+**`check` says UNREACHABLE (401) or NOT FOUND (404) for `Qwen/…-FP8-MXFP4`.**
+Expected as of 14 Aug 2026 — 401 anonymously, 404 with a token that lacks access;
+both mean you cannot pull it. Pick a candidate that reports OK, set `MODEL_ID` and
+`WEIGHTS_GB` in `qwen38.env`, and re-run `check` **in a shell where `MODEL_ID` is
+not exported** (see the entry above).
 
 **`check` reports "0 architectures registered" / INCONCLUSIVE.**
 Not a "no". Every model module failed to import. Look for repeated

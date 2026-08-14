@@ -6,6 +6,22 @@
 # shell (or in an sbatch --export) takes precedence over this file.
 # qwen38.env contains your HF token — keep it out of git (see .gitignore).
 #
+# ┌── READ THIS ONCE ─────────────────────────────────────────────────────────┐
+# │ You do NOT need to 'source qwen38.env' to run these scripts. They read    │
+# │ the file themselves. Sourcing it EXPORTS every value into your shell, and │
+# │ because of the ${VAR:-default} form above, those exports then beat every  │
+# │ later edit you make to this file — silently.                              │
+# │                                                                           │
+# │   $ source qwen38.env     # exports MODEL_ID=<old>                        │
+# │   $ vi qwen38.env         # change MODEL_ID                               │
+# │   $ ./serve-qwen38.sh …   # still uses <old>. Your edit did nothing.      │
+# │                                                                           │
+# │ This bit someone on bun161 on 14 Aug 2026. The scripts now detect it and  │
+# │ tell you to 'unset' the offending variable, but the simplest habit is:    │
+# │ edit this file, run the scripts, and only source it in a shell that wants │
+# │ $MODEL_CACHE_DIR for its own commands.                                    │
+# └───────────────────────────────────────────────────────────────────────────┘
+#
 # The defaults reproduce SGLang's VERIFIED single-node MI355X MXFP4 cookbook
 # cell (hw=mi355x, quant=mxfp4, strategy=balanced, nodes=single), which is
 # exactly:
@@ -436,16 +452,64 @@ export ROCMINFO_SHIM="${ROCMINFO_SHIM:-auto}"
 # single required env var and the MoE will run far below its tuned speed.
 export ENABLE_AITER="${ENABLE_AITER:-1}"
 
-# AITER_FLYDSL_FORCE routes gemms through the FlyDSL JIT compiler, which writes
-# into aiter/jit inside the read-only .sif. Set to 0 to use aiter's prebuilt
-# gemm path instead: slower, but it compiles nothing, so it cannot hit the
-# read-only-filesystem crash at CUDA-graph capture.
+# AITER_FLYDSL_FORCE routes gemms through the FlyDSL JIT compiler.
 #
-# NOTE this is NOT part of the upstream MI355X cell — it is carried over from
-# this repo's Kimi K3 sibling because the failure it guards is a property of
-# Apptainer, not of the model. If you are chasing a numerics difference against
-# upstream, this is the first variable to drop.
-export FLYDSL_FORCE="${FLYDSL_FORCE:-1}"
+# DEFAULT CHANGED TO 0 ON 14 AUG 2026 (it was 1). Reasoning:
+#
+# This variable is OURS, not upstream's. The verified MI355X cell sets
+# SGLANG_USE_AITER=1 and nothing else, and AITER_FLYDSL_FORCE appears nowhere in
+# SGLang mainline — aiter reads it. It was carried over from this repo's Kimi K3
+# sibling, where it was the measured fast path on K3's MoE shapes.
+#
+# Qwen3.8's MoE shapes are different (expert intermediate 2048 vs K3's 3072), and
+# forcing the JIT path when there is no tuned config for these shapes is exactly
+# how you land on the slow heuristic fallback that bench-qwen38.sh warns about.
+# So the out-of-box run is now upstream's cell verbatim, carrying no unvalidated
+# variable inherited from a different model.
+#
+# Turning it to 1 is the FIRST rung of the tuning ladder below. Measure it; do
+# not assume it either way. bench-qwen38.sh records which setting produced each
+# result file and says so if it detects the heuristic path.
+export FLYDSL_FORCE="${FLYDSL_FORCE:-0}"
+
+# ── Tuning ladder — all default OFF, none of them upstream's ────────────────
+#
+# These are SGLang defaults-off that look matched to THIS architecture. Upstream's
+# verified cell sets none of them, and nothing here is measured on Bunya. Treat
+# each as a hypothesis with a benchmark attached: turn on ONE, run
+# './bench-qwen38.sh sweep' with BENCH_REPEATS=3, keep it only if it beats the
+# error bar. Suggested order is the order they appear.
+#
+# 1. FLYDSL_FORCE=1 (above).
+# 2. SPECULATIVE=nextn (above) — free, MTP ships in the checkpoint.
+# 3. ROCM_MULTI_STREAM — dual-stream MoE: the shared expert and the routed
+#    experts run on separate HIP streams instead of serialising. Qwen3.8 routes
+#    10 experts plus 1 SHARED expert per token, which is exactly the shape this
+#    targets. SGLang's own note: "Requires GPU_MAX_HW_QUEUES>=5 to avoid
+#    HW-queue serialization" — serve-qwen38.sh sets that for you if you leave
+#    GPU_MAX_HW_QUEUES empty, and warns if you set it too low.
+export ROCM_MULTI_STREAM="${ROCM_MULTI_STREAM:-0}"
+export GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-}"
+
+# 4. AITER_KV_LAYOUT — physical layout for the full-attention KV cache.
+#    "" / nhd (default) is (size, head_num, head_dim) per token.
+#    "vectorized_5d" is the SHUFFLE layout that aiter's CK FmhaBatchPrefill and
+#    aiter.ops.triton.gluon.pa_decode_gluon consume NATIVELY, so full-attention
+#    decode avoids runtime permutes. Qwen3.8 has 23 such layers (64 query heads
+#    over 4 KV heads, head dim 256). Plausible decode win; unmeasured.
+export AITER_KV_LAYOUT="${AITER_KV_LAYOUT:-}"
+
+# 5. AITER_FP8_PER_TOKEN — per-token FP8 quantisation on the aiter path. The
+#    MXFP4 checkpoint is HYBRID: MXFP4 experts, FP8 attention and dense layers.
+#    This touches that FP8 half. Unmeasured.
+export AITER_FP8_PER_TOKEN="${AITER_FP8_PER_TOKEN:-0}"
+
+# NOT ON THE LADDER, AND DO NOT ADD IT: SGLANG_USE_AITER_MOE_GU_ITLV.
+# It reads like a performance knob and is not one. SGLang's mxfp4.py uses
+# gate_up_interleaved to pick a WEIGHT-LAYOUT TRANSFORM matched to how the
+# checkpoint physically stores w13 (the non-interleaved branch is commented
+# "e.g. K3 Latent MoE"). Flipping it gives you wrong output, not slower output —
+# and wrong output from this model looks like fluent, confident nonsense.
 
 # SGLang CPU-affinity pinning. The container image enables it, but it pins to
 # CPUs from the full node topology and CRASHES under a SLURM cgroup that owns
