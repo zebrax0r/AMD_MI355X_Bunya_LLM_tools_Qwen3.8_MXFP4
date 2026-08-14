@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "qwen38-bunya": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Qwen3.8 (Bunya MI355X)",
+      "options": {
+        "baseURL": "http://__HOST__:__PORT__/v1",
+        "apiKey": "{env:QWEN38_API_KEY}"
+      },
+      "models": {
+        "__MODEL__": {
+          "name": "Qwen3.8 2.4T-A95B MXFP4",
+          "limit": {
+            "context": __CONTEXT__,
+            "output": 131072
+          },
+          "tool_call": true,
+          "reasoning": true
+        }
+      }
+    }
+  }
+}

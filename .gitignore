@@ -1,0 +1,5 @@
+qwen38.env
+logs/
+bench/
+*.bak
+*.sif

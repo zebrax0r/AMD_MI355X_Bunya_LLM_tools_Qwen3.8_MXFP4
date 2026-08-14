@@ -1,0 +1,532 @@
+# Configuration for serve-qwen38.sh on Bunya's MI355X — copy to qwen38.env and edit.
+#
+#   cp qwen38-env.example qwen38.env
+#
+# Every value uses the ${VAR:-default} form, so anything you export in your
+# shell (or in an sbatch --export) takes precedence over this file.
+# qwen38.env contains your HF token — keep it out of git (see .gitignore).
+#
+# The defaults reproduce SGLang's VERIFIED single-node MI355X MXFP4 cookbook
+# cell (hw=mi355x, quant=mxfp4, strategy=balanced, nodes=single), which is
+# exactly:
+#
+#   SGLANG_USE_AITER=1 sglang serve \
+#     --trust-remote-code --model-path <MODEL> --tp-size 8 \
+#     --mem-fraction-static 0.9 \
+#     --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
+#     --host <HOST> --port <PORT>
+#
+# Note what is NOT in that list: no --attention-backend, no --moe-runner-backend,
+# no --mamba-ssm-dtype, no --context-length, no speculative flags. Every one of
+# those is a deliberate omission upstream, not an oversight, and the defaults
+# below keep them omitted. Change them from measurement, not by guess.
+
+# ── Required ────────────────────────────────────────────────────────────────
+
+# Scratch path for the HuggingFace cache, the .sif, the API key, and the server
+# log/PID. Point this at /scratch (NOT /home — tight quota) and make sure it is
+# visible from the compute node.
+#
+#   Qwen3.8 MXFP4 weights   ~1372 GB (amd/…-Quark-MXFP4; the Inferact one is 1597)
+#   container .sif           ~24 GB
+#   DSpark draft              6.6 GB  (only if SPECULATIVE=dspark)
+#   -> plan for ~1.5 TB free.  Check with 'rquota' and 'df -h'.
+#
+export MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-}"
+# e.g. export MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-/scratch/user/$USER/qwen38/hf-cache}"
+
+# HuggingFace token, needed for the first weights download — and, right now,
+# needed to find out whether the canonical checkpoint is reachable at all.
+# Either set the token directly ...
+export HF_TOKEN="${HF_TOKEN:-}"
+# ... or point at a file containing only the token (safer for shared configs):
+export HF_TOKEN_FILE="${HF_TOKEN_FILE:-}"
+
+# ── Model ───────────────────────────────────────────────────────────────────
+#
+# READ THIS BEFORE YOUR FIRST DOWNLOAD.
+#
+# The id below is the one SGLang's verified MI355X cell names and the cookbook
+# links to. As of 14 Aug 2026 it returns HTTP 401 to an anonymous request — the
+# model page, the API and resolve/main/config.json all refuse — while the BF16
+# and FP8 repos of the same model are public. It is private or gated. If you
+# have been granted access, your HF_TOKEN will open it; if not, you need one of
+# the alternatives below.
+#
+# Run './serve-qwen38.sh check' FIRST. It probes every candidate with your token
+# and prints reachability, size and the declared quant_method, so you learn which
+# one you can actually fetch before committing to a ~1.4 TB transfer.
+#
+# The three known MXFP4 checkpoints:
+#
+#   Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4      canonical, the validated one, 401 today
+#   amd/Qwen3.8-2.4T-A95B-Quark-MXFP4     1372 GB, 213 shards, quant_method=quark
+#                                         AMD's own Quark MXFP4 of the FP8 base.
+#                                         Smallest, so the most KV/GDN headroom.
+#   Inferact/Qwen3.8-2.4T-A95B-MXFP4      1597 GB, 101 shards, quant_method=mxfp4
+#                                         Declares the exact string SGLang's MoE
+#                                         auto-resolution keys on. Community repo.
+#
+# Neither alternative is the checkpoint upstream validated. Whichever you serve,
+# read the first replies for coherence rather than assuming — a wrong-but-loading
+# quantisation produces fluent nonsense, not an error.
+export MODEL_ID="${MODEL_ID:-Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4}"
+
+# What 'check' probes. Space-separated. Add your own if a better MXFP4 repo
+# appears; MODEL_ID is always included whether or not it is in this list.
+export MODEL_CANDIDATES="${MODEL_CANDIDATES:-Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4 amd/Qwen3.8-2.4T-A95B-Quark-MXFP4 Inferact/Qwen3.8-2.4T-A95B-MXFP4}"
+
+# The name clients put in the OpenAI "model" field.
+export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8}"
+
+# Weight size in GB, used for the free-space preflight, the presharded space
+# check and the effective-GB/s readout after a cold start. Set it to match
+# whichever MODEL_ID you settled on — 'check' prints the real number per
+# candidate. Default is the AMD Quark checkpoint's 1372.
+export WEIGHTS_GB="${WEIGHTS_GB:-1372}"
+
+# ── Container image ─────────────────────────────────────────────────────────
+
+# SGLang's pinned AMD image for gfx950 (MI350X/MI355X, ROCm 7.20), from the
+# Qwen3.8 cookbook's Deployment section. 23.7 GB compressed, pushed 12 Aug 2026.
+#
+# DO NOT substitute the mi30x image. Upstream is explicit that the two are not
+# interchangeable: they target different GPU architectures AND different ROCm
+# versions, and aiter's kernels will not load on the wrong one. MI300X is CDNA3
+# (gfx942), has no hardware MX matmul, and cannot run this checkpoint at all.
+#
+# The image ships its OWN ROCm (7.2.0, the 'rocm720' in the tag). It does not
+# have to match the node's — Bunya's MI355X nodes have been on 7.14 — but the
+# further apart they drift the more likely GPU passthrough breaks. See ROCM_MODE
+# below and './serve-qwen38.sh gpucheck'. After changing this value the aiter JIT
+# dir re-seeds itself automatically.
+#
+# Migrate to a newer tag into a SECOND SIF_PATH and re-verify with 'check', then
+# 'parsers', 'toolcheck' and a full bench before switching over.
+export SGLANG_IMAGE="${SGLANG_IMAGE:-docker://lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812}"
+
+# Path to the Apptainer image FILE (built with './serve-qwen38.sh pull').
+# Must be a .sif file, not a directory. Defaults to
+# $MODEL_CACHE_DIR/qwen38-mi355x.sif.
+export SIF_PATH="${SIF_PATH:-}"
+
+# Apptainer cache/scratch. Keep these OFF /home (quota) — on scratch. Default is
+# alongside MODEL_CACHE_DIR if left empty.
+export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-}"
+export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-}"
+
+# The MXFP4 MoE JIT-compiles FlyDSL kernels into aiter's jit/ directory INSIDE
+# the image, which is read-only in a .sif — so capture dies with "[Errno 30]
+# Read-only file system: .../aiter/jit/flydsl_cache/...", and it dies only
+# after the full ~1.4 TB weight load. serve-qwen38.sh seeds this scratch dir
+# from the image's jit/ (once, to keep the prebuilt module_*.so) and binds it
+# back over the same path, so writes succeed and compiled kernels persist
+# across runs. Defaults to $MODEL_CACHE_DIR/aiter-jit.
+#
+# The seed marker records which image it came from, so changing SGLANG_IMAGE
+# re-seeds automatically — a stale copy from an older image is otherwise a good
+# way to get undefined-symbol crashes at graph capture. Deleting the directory
+# by hand also works.
+export AITER_JIT_DIR="${AITER_JIT_DIR:-}"
+# In-image jit/ path. Auto-detected; set only if detection picks the wrong one
+# (it warns loudly when it cannot find aiter at all).
+export AITER_JIT_TARGET="${AITER_JIT_TARGET:-}"
+
+# ── Endpoint auth ───────────────────────────────────────────────────────────
+
+# API key for the endpoint (clients send "Authorization: Bearer ..."). Leave
+# empty to have serve-qwen38.sh generate one and persist it to
+# ${MODEL_CACHE_DIR}/qwen38-api-key so it stays stable across jobs.
+#
+# This is one of our deliberate deviations from upstream: their recipe binds to
+# 127.0.0.1 and needs no auth, but we bind 0.0.0.0 so tunnels and off-node
+# clients work — so the key is the only thing gating the port.
+export QWEN38_API_KEY="${QWEN38_API_KEY:-}"
+
+# ── Serving parameters (the verified cell) ──────────────────────────────────
+
+export PORT="${PORT:-30000}"
+
+# An MI355X node has 8 GPUs and --tp-size IS the total GPU count. The verified
+# cell is TP8 on one node, and at ~1.4 TB of weights against 8 x 288 GB there is
+# no smaller layout that fits.
+export TP_SIZE="${TP_SIZE:-8}"
+
+# dp-attention groups. Upstream does not use it on this cell; DP_SIZE must
+# divide TP_SIZE. Note that turning DP attention on also constrains speculative
+# decoding — it then additionally requires --enable-dp-lm-head, the built-in TP
+# MoE, and no context parallel.
+export DP_SIZE="${DP_SIZE:-1}"
+
+# Max context. EMPTY = the model's own maximum, which is what the upstream
+# recipe does — it passes no --context-length at all.
+#
+# Qwen3.8 is 262,144 native, extensible to 1,010,000 with RoPE scaling. The
+# native window is what an unmodified checkpoint reports.
+#
+# If the KV/GDN pools fail to allocate at startup, set this to 131072 FIRST
+# (before touching MEM_FRACTION) so you learn which knob mattered.
+export CONTEXT_LEN="${CONTEXT_LEN:-}"
+
+# --mem-fraction-static. 0.9 is upstream's validated value and it LOOKS
+# aggressive on purpose. With the aiter backend above 8192 context SGLang
+# multiplies it by 0.85 before allocating, so 0.9 actually lands at ~0.765.
+#
+# DO NOT "FIX" THIS DOWNWARD. Upstream says so explicitly. The arithmetic:
+#   8 x 288 GB      = 2304 GB HBM
+#   0.765 x 2304    = 1763 GB static allocation
+#   minus ~1372 GB of weights
+#   = ~390 GB for KV cache + GDN state pool + CUDA graphs
+# Lowering it to a "safer" 0.85 costs you ~100 GB of that 390, which is a
+# quarter of your concurrency headroom.
+export MEM_FRACTION="${MEM_FRACTION:-0.9}"
+
+# --attention-backend. EMPTY = pass no flag, which is what the verified cell
+# does. trtllm_mha is SM100-only; on gfx950 the model hook picks for itself.
+# Setting a value here is how you quietly opt out of that choice.
+export ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
+
+# --quantization. EMPTY = pass no flag. Upstream: "Leave --moe-runner-backend
+# unset and the runner resolves from the checkpoint's own quant_method." The
+# same applies here. Set this only if you are serving a checkpoint whose
+# declared method SGLang resolves wrongly — './serve-qwen38.sh check' prints
+# what each candidate declares. Valid values include mxfp4, quark, quark_mxfp4.
+export QUANTIZATION="${QUANTIZATION:-}"
+
+# --cuda-graph-max-bs-decode. EMPTY = the image's default, which is what
+# upstream passes. Raise for more decode concurrency (costs memory), lower if
+# graph capture OOMs.
+export CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-}"
+
+# --disable-radix-cache. 0 (caching ON) is both upstream's default here and the
+# right choice for agentic clients, which resend a near-identical context every
+# turn.
+#
+# IT IS ALSO LOAD-BEARING FOR THE GDN STATE POOL. extra_buffer — what
+# MAMBA_RADIX_STRATEGY 'auto' resolves to for this model — requires the radix
+# cache to be on: mamba_extra_buffer_of() checks disable_radix_cache is false.
+# Turn the cache off and the strategy goes inert, dropping the state budget from
+# 5 slots per request to 1. Nothing in the log says so. serve-qwen38.sh warns.
+export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
+
+# KV cache dtype. Upstream passes none on MI355X (the MI300X cell uses
+# fp8_e4m3 + --page-size 16 because 8 x 192 GB is memory-bound; we are not).
+# Set only if you have benched it and it helps.
+export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
+
+# --page-size. EMPTY = default. Only paired with KV_CACHE_DTYPE above.
+export PAGE_SIZE="${PAGE_SIZE:-}"
+
+# ── Parsers (tool calling + thinking) ───────────────────────────────────────
+
+# Qwen3.8 uses qwen3_coder for tools and qwen3 for reasoning.
+#
+# THE REASONING PARSER IS NOT OPTIONAL IN PRACTICE. Qwen3.8 always reasons —
+# thinking cannot be turned off — and every response opens with a <think>…</think>
+# block. Without the parser the server still returns 200 and every reply arrives
+# with raw <think> tags glued to the front of `content`, which is not an error
+# anywhere in the stack; it just makes agentic clients behave strangely.
+# './serve-qwen38.sh toolcheck' asserts this directly.
+#
+# Per-request depth is controlled by the client with reasoning_effort:
+# "xhigh" (the default), "medium", or "low". preserve_thinking carries reasoning
+# from earlier turns into context and is on by default.
+#
+# List what your image actually supports with:  ./serve-qwen38.sh parsers
+# Set to "none" to pass no parser flag at all.
+export TOOL_PARSER="${TOOL_PARSER:-qwen3_coder}"
+export REASONING_PARSER="${REASONING_PARSER:-qwen3}"
+
+# ── Speculative decoding ────────────────────────────────────────────────────
+#
+# Empty (default) = off, which is the verified cell verbatim. Get baseline
+# serving working and benched first — that way a failure has one cause, not two.
+#
+#   nextn   The checkpoint's own MTP (multi-token-prediction) head. No draft
+#           model to download; the 3/1/4 preset fills in automatically. This is
+#           what upstream's NVIDIA cells use, and it is the cheaper of the two
+#           to try because there is nothing extra to fetch.
+#
+#   dspark  RadixArk's trained draft model (6.6 GB, separate repo). NOT part of
+#           the verified MI355X matrix — upstream offers the DSpark chip only on
+#           GB300 FP8/NVFP4/BF16 and B300 NVFP4, because everything else on the
+#           page is pipelined or wide-EP. MI355X is neither, so it is plausible
+#           here; it is simply unvalidated. Treat any number as new information.
+#
+# TWO THINGS TO KNOW BEFORE TURNING EITHER ON:
+#
+# 1. THE MRR-48 TRAP. A speculative cell with no --max-running-requests takes 48
+#    from the speculative hook rather than a memory-derived ceiling. Nothing
+#    errors; you just serve a fraction of what the node can hold, and the
+#    throughput number you bench is wrong for a reason no log line mentions.
+#    Set MAX_RUNNING_REQUESTS below. serve-qwen38.sh warns if you do not.
+#
+# 2. THE ROCm SAMPLING LANDMINE, AND IT IS WORSE HERE THAN IT WAS ON KIMI K3.
+#    The speculative verify step calls top_k_renorm_prob / top_p_renorm_prob,
+#    which on ROCm are bound by an is_hip() branch that landed in two halves
+#    (sglang #32621 top_p, #32641 top_k). An image predating those has neither,
+#    both names are None, and the first request that sets either one raises
+#    inside the scheduler's event loop and KILLS THE SERVER — not just that
+#    request. There is a second one (sglang #33694, fixed 6 Aug 2026) that fires
+#    on temperature > 0.
+#
+#    Qwen's own recommended sampling for this model is temperature=1.0,
+#    top_p=0.95, top_k=20. The documented settings send BOTH affected parameters
+#    and a non-zero temperature. On K3 you had to go out of your way to trip
+#    this; here a normal client finds it on the first request.
+#
+#    serve-qwen38.sh greps the image for the Triton aliases AND for that binding
+#    and warns at launch, so you cannot meet either unknowingly. The pinned
+#    v0.5.17-…-20260812 image postdates all three fixes and should be clean —
+#    read the launch output and confirm rather than assuming.
+export SPECULATIVE="${SPECULATIVE:-}"
+
+export DSPARK_MODEL="${DSPARK_MODEL:-RadixArk/Qwen3.8-2.4T-A95B-DSpark}"
+
+# Which draft revision to serve. UNPINNED by default, unlike this repo's Kimi K3
+# sibling — that pin existed because RadixArk/Kimi-K3-DSpark was rewritten three
+# times in four days, twice breaking the launch outright. This draft has one
+# revision and no history of churn yet. The moment it gets one, pin it here:
+# a changed draft either changes what you serve or stops it starting, and
+# neither announces itself. A 40-hex value names a snapshot directly; anything
+# else is treated as a branch or tag.
+export DSPARK_REVISION="${DSPARK_REVISION:-}"
+
+# gamma — how many draft tokens DSpark proposes per step. Empty lets SGLang
+# infer it from the draft checkpoint's block_size, which reads 7 today. Setting
+# 7 explicitly changes nothing about how the server runs; it is worth setting as
+# an ANCHOR against the draft repo being rewritten under you.
+export DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-}"
+
+# The NEXTN preset is 3 steps / topk 1 / 4 draft tokens and fills itself in.
+# These exist so you can move off it deliberately. Empty = leave SGLang alone.
+export SPEC_NUM_STEPS="${SPEC_NUM_STEPS:-}"
+export SPEC_EAGLE_TOPK="${SPEC_EAGLE_TOPK:-}"
+export SPEC_NUM_DRAFT_TOKENS="${SPEC_NUM_DRAFT_TOKENS:-}"
+
+# ReplaySSM spec-verify: --enable-linear-replayssm-spec.
+#
+# A GDN layer's recurrent state overwrites itself every token, so speculative
+# verify has to be rewindable. Snapshotting the whole K x V state per draft step
+# costs 64 KiB per request, layer and head at K=V=128, times gamma+1 steps —
+# scratch taken out of the same budget as the persistent state pool. ReplaySSM
+# stores each draft step's raw inputs instead (a few hundred bytes) and replays
+# the accepted prefix with one fold kernel. The fold is a verbatim clone of the
+# verify recurrence, so the rebuilt state is bit-identical: there is no accuracy
+# tradeoff, only a memory one, and draft-step scratch shrinks by roughly two
+# orders of magnitude.
+#
+# READ THE FLAG NAME. There is a separate --enable-linear-replayssm (buffered
+# DECODE, not verify) which is mutually exclusive with this one and requires
+# --mamba-radix-cache-strategy no_buffer. Do not "simplify" one into the other.
+#
+# Constraint: linear-chain only. --speculative-eagle-topk must be unset or 1.
+# Off by default and DSpark does not turn it on; it is a separate opt-in.
+export REPLAYSSM_SPEC="${REPLAYSSM_SPEC:-0}"
+
+# ── GDN state pool (Qwen3.8 hybrid attention) ───────────────────────────────
+#
+# Qwen3.8 is a hybrid: 69 of its 92 layers are Gated DeltaNet linear attention,
+# which holds a fixed-size recurrent STATE per request, and 23 are gated full
+# attention, which holds an ordinary KV cache (64 query heads over 4 KV heads at
+# head dim 256). --mem-fraction-static buys one pool of memory; these knobs
+# decide how it is split and how much each request costs.
+#
+# UPSTREAM IS EXPLICIT THAT GDN STATE, NOT KV, IS USUALLY WHAT CAPS CONCURRENCY.
+# State slots consumed per request, by caching strategy:
+#
+#   --disable-radix-cache      1
+#   no_buffer                  3
+#   extra_buffer  ('auto')     5   (4 where PP disables the overlap scheduler)
+#   extra_buffer_lazy          4
+#
+# ALL EMPTY BY DEFAULT — the server is launched with exactly the argv it was
+# before these existed. Change one, re-run ./bench-qwen38.sh, keep it if the
+# numbers improve. None of these are measured on Bunya yet.
+
+# --mamba-full-memory-ratio: GDN state pool vs KV pool. This is upstream's
+# preferred lever — every cookbook cell leaves the pool to it except two GB300
+# ones whose pins are part of tuned capacity sets. The right value follows your
+# MEAN REQUEST LENGTH (input + output): short interactive turns want more state,
+# long contexts want more KV.
+export MAMBA_FULL_MEMORY_RATIO="${MAMBA_FULL_MEMORY_RATIO:-}"
+
+# --max-mamba-cache-size: a hard cap on state slots, in slots not requests. It
+# HAS to match the ratio in force or it silently clamps max_running_requests to
+# a fraction of your target. Upstream's worked example: GB300 Low Latency pins
+# 80, which is exactly its 16 concurrent requests x 5 slots. serve-qwen38.sh
+# does that arithmetic for you and warns when it undercuts
+# MAX_RUNNING_REQUESTS. Prefer MAMBA_FULL_MEMORY_RATIO unless you are pinning a
+# tuned capacity set.
+export MAX_MAMBA_CACHE_SIZE="${MAX_MAMBA_CACHE_SIZE:-}"
+
+# --mamba-radix-cache-strategy. Empty = auto, which for this model is
+# extra_buffer. Fewer slots means more concurrent requests and less prefix
+# reuse. Has no useful meaning with DISABLE_RADIX_CACHE=1 — extra_buffer goes
+# inert there and the budget drops to 1 slot.
+export MAMBA_RADIX_STRATEGY="${MAMBA_RADIX_STRATEGY:-}"
+
+# --mamba-ssm-dtype. Empty = the model's default. bfloat16 halves GDN state
+# memory, which buys concurrency directly.
+#
+# NOTE: upstream's "--mamba-ssm-dtype bfloat16 is load-bearing" guidance is
+# SM100-ONLY — it gates FlashInfer's GDN decode default on Blackwell. On gfx950
+# there is no such default to unlock, so this is a memory knob here, not a
+# correctness one. If you test it, watch quality, not just throughput.
+export MAMBA_SSM_DTYPE="${MAMBA_SSM_DTYPE:-}"
+
+# --enable-int8-mamba-checkpoint: stores radix-cached GDN states in int8 in a
+# separate checkpoint pool, for roughly 2x cached-prefix capacity at fixed
+# memory. Mainline feature, untested here. Affects CACHED states only, not the
+# live ones, so it trades prefix-reuse fidelity for capacity.
+export INT8_MAMBA_CHECKPOINT="${INT8_MAMBA_CHECKPOINT:-0}"
+
+# --linear-attn-backend. Empty = default. Upstream pins flashinfer variants only
+# on NVIDIA cells (the flashinfer GDN path is SM90/SM100); on gfx950 the Triton
+# path is what runs. Do not copy an H200 or GB300 value here.
+export LINEAR_ATTN_BACKEND="${LINEAR_ATTN_BACKEND:-}"
+
+# ── ROCm / AMD kernel toggles ───────────────────────────────────────────────
+
+# How the container reaches the GPUs.
+#
+#   auto     (default) probe 'rocm', then 'devices', and use the first that
+#            actually sees the GPUs. The answer is cached per node+image in
+#            $MODEL_CACHE_DIR/.rocm-mode; delete that file to re-probe.
+#   rocm     apptainer --rocm. Binds the NODE's ROCm libraries into the
+#            container and puts them first on LD_LIBRARY_PATH.
+#   devices  no --rocm; bind /dev/kfd and /dev/dri only, so the container uses
+#            its own ROCm end to end.
+#
+# Why this exists: Bunya's MI355X nodes have run ROCm 7.14 while this image
+# ships 7.2.0. With --rocm, the container's own /opt/rocm-7.2.0/bin/rocminfo
+# fails against the node's newer libraries, and aiter dies on import with
+# "Get GPU arch from rocminfo failed". 'devices' avoids that mixing.
+#
+# Run './serve-qwen38.sh gpucheck' (about a minute) to see the per-mode result.
+export ROCM_MODE="${ROCM_MODE:-auto}"
+
+# Tells aiter the GPU architecture directly (as GPU_ARCHS), so it can skip its
+# rocminfo shell-out. Not every aiter build honours it at runtime, so treat this
+# as a maybe and use ROCMINFO_SHIM below as the reliable route.
+# Must name exactly ONE arch: a list makes aiter pick the first entry at
+# runtime regardless of the hardware (ROCm/aiter#3807). Empty = leave alone.
+export AITER_GPU_ARCHS="${AITER_GPU_ARCHS:-}"   # e.g. gfx950
+
+# aiter reads the GPU architecture by running the image's rocminfo and parsing
+# its text. On a node whose ROCm is newer than the image's, that binary fails
+#   ROCk module version 6.19.14.31400000 is loaded
+#   hsa api call failure ... HSA_STATUS_ERROR_INVALID_ARGUMENT
+# even though torch sees all 8 GPUs (PyTorch's wheel bundles its own HIP
+# runtime). So the image's ROCm *tools* break while its *runtime* is fine.
+#
+# The shim snapshots the HOST's working rocminfo output and binds a one-line
+# script that replays it over the container's binary. Real output for this
+# node, so whatever aiter's parser expects it gets; nothing links against it.
+#
+#   auto  (default) shim only when the container's own rocminfo fails
+#   off   never
+#   force always (use if detection says it works but aiter still can't read it)
+export ROCMINFO_SHIM="${ROCMINFO_SHIM:-auto}"
+
+# aiter is AMD's fused kernel library and is where the gfx950 MXFP4 MoE speed
+# comes from. SGLANG_USE_AITER=1 is the ONE environment variable the verified
+# MI355X cell sets. With 1 (default) serve-qwen38.sh exports it into the
+# container. Set to 0 only to isolate an aiter crash — it drops the recipe's
+# single required env var and the MoE will run far below its tuned speed.
+export ENABLE_AITER="${ENABLE_AITER:-1}"
+
+# AITER_FLYDSL_FORCE routes gemms through the FlyDSL JIT compiler, which writes
+# into aiter/jit inside the read-only .sif. Set to 0 to use aiter's prebuilt
+# gemm path instead: slower, but it compiles nothing, so it cannot hit the
+# read-only-filesystem crash at CUDA-graph capture.
+#
+# NOTE this is NOT part of the upstream MI355X cell — it is carried over from
+# this repo's Kimi K3 sibling because the failure it guards is a property of
+# Apptainer, not of the model. If you are chasing a numerics difference against
+# upstream, this is the first variable to drop.
+export FLYDSL_FORCE="${FLYDSL_FORCE:-1}"
+
+# SGLang CPU-affinity pinning. The container image enables it, but it pins to
+# CPUs from the full node topology and CRASHES under a SLURM cgroup that owns
+# only a subset of cores ("CPU number N is not eligible"). Keep 0 unless you
+# allocate the whole node's CPUs (e.g. --exclusive or --cpus-per-task=384).
+# This one is ours, not upstream's — they have no cgroup to trip over.
+export SET_CPU_AFFINITY="${SET_CPU_AFFINITY:-0}"
+
+# Seconds to wait for the server to become healthy. A cold start reads ~1.4 TB
+# off scratch and JIT-compiles MXFP4 kernels, so be generous.
+export READY_TIMEOUT="${READY_TIMEOUT:-14400}"
+
+# ── Weight loading ──────────────────────────────────────────────────────────
+#
+# SGLang quietly falls back to SINGLE-THREADED weight loading whenever its
+# checkpoint prefetch is on and you have not asked for threads explicitly — it
+# logs "falling back to single-threaded weight loading to avoid I/O
+# oversubscription with the prefetch threads". One sequential reader against
+# GPFS is what makes a cold start sawtooth: a burst while a shard streams, a dip
+# while it is converted and copied to HBM, then the next shard.
+#
+# Setting this names num_threads in --model-loader-extra-config, which is what
+# suppresses that fallback. Upstream reports ~3x. 0 = pass nothing and take the
+# image's default.
+#
+# Memory: the buffered loader holds ~(threads + 2) shards at once. The AMD
+# checkpoint's shards are ~6.5 GB (1372 GB / 213), so 8 is ~65 GB against
+# --mem=1800G. The Inferact checkpoint has 101 much larger shards — check your
+# --mem before raising the thread count on that one. Past ~16 the GPFS client,
+# not the thread count, is normally the limit.
+#
+# NOT yet measured on Bunya — run './serve-qwen38.sh loadstat' after a start.
+export WEIGHT_LOAD_THREADS="${WEIGHT_LOAD_THREADS:-8}"
+
+# Empty = the image's default (auto). The interesting one is 'presharded': the
+# first run loads normally then dumps a per-rank, already-quantised checkpoint,
+# and every later run reads only its own 1/8 and skips re-quantisation. That is
+# the big win for a 48 h allocation you restart in, and it costs one slow load
+# plus up to another ~1.4 TB of scratch.
+export LOAD_FORMAT="${LOAD_FORMAT:-}"
+
+# Where 'presharded' writes. Must be writable and on a filesystem all ranks
+# see; the HF cache path itself is not a good target. Ignored unless
+# LOAD_FORMAT=presharded.
+#   e.g. export PRESHARDED_PATH="/scratch/user/$USER/qwen38/presharded"
+export PRESHARDED_PATH="${PRESHARDED_PATH:-}"
+
+# SGLANG_PREFETCH_BLOCK_SIZE_MB — the sequential read size prefetch uses to warm
+# the page cache. Empty = SGLang's default. Only worth touching after the thread
+# count, and only with a cold-run measurement to compare against.
+export PREFETCH_BLOCK_SIZE_MB="${PREFETCH_BLOCK_SIZE_MB:-}"
+
+# ── Escape hatches ──────────────────────────────────────────────────────────
+
+# How the server is invoked inside the container. Upstream uses the 'sglang'
+# CLI. If it is missing or behaves oddly in your image, fall back to:
+#   export LAUNCH_CMD="python3 -m sglang.launch_server"
+export LAUNCH_CMD="${LAUNCH_CMD:-sglang serve}"
+
+# Optional, all empty = upstream defaults. Measure every change with
+# ./bench-qwen38.sh.
+export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-}"   # lower if prefill OOMs
+export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"   # see the MRR-48 trap above
+export SCHEDULE_POLICY="${SCHEDULE_POLICY:-}"             # e.g. lpm (needs radix cache on)
+
+# Extra flags appended verbatim to the launch command. Use this for anything
+# version-specific rather than editing the script, e.g. expert parallelism:
+#   export EXTRA_ENGINE_ARGS="--ep-size 8"
+export EXTRA_ENGINE_ARGS="${EXTRA_ENGINE_ARGS:-}"
+
+# ── Benchmark defaults (bench-qwen38.sh) ────────────────────────────────────
+#
+# There are NO published MI355X throughput figures for Qwen3.8 — upstream marks
+# the cell verified (it runs and is correct) but publishes no numbers for it.
+# Whatever you measure here is the first data point, so record the node and the
+# date with it, and use BENCH_REPEATS>=3 before concluding anything.
+
+export BENCH_INPUT_LEN="${BENCH_INPUT_LEN:-1024}"
+export BENCH_OUTPUT_LEN="${BENCH_OUTPUT_LEN:-512}"
+export BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-200}"
+export BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-2 8 32}"
+export BENCH_MAX_CONCURRENCY="${BENCH_MAX_CONCURRENCY:-32}"
+export BENCH_REPEATS="${BENCH_REPEATS:-1}"
+export BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS:-}"

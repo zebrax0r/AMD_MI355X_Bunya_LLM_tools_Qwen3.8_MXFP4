@@ -1,0 +1,23 @@
+{
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "__MODEL__",
+        "name": "Qwen3.8 (Bunya MI355X)",
+        "baseUrl": "http://__HOST__:__PORT__/v1",
+        "envKey": "OPENAI_API_KEY",
+        "generationConfig": {
+          "contextWindowSize": __CONTEXT__
+        }
+      }
+    ]
+  },
+  "security": {
+    "auth": {
+      "selectedType": "openai"
+    }
+  },
+  "model": {
+    "name": "__MODEL__"
+  }
+}
